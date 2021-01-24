@@ -4,76 +4,80 @@ import * as Joi from 'joi';
 // Data
 
 const eventSchema = Joi.object({
-    date: Joi.string(), // TODO validate
-    place: Joi.string(),
+    date: Joi.string().allow(''), // TODO validate
+    place: Joi.string().allow(''),
 });
 
-const individualSchema = Joi.object({
-    surname: Joi.string(),
-    givenName: Joi.string(),
+const idSchema = Joi.string();
+
+const individualSchema = {
+    surname: Joi.string().allow(''),
+    givenName: Joi.string().allow(''),
     birthEvent: eventSchema,
     deathEvent: eventSchema,
-    parents: Joi.object({
-        unionEvent: eventSchema,
-        husbandIndividualId: Joi.string(),
-        wifeIndividualId: Joi.string(),
-    }),
+}
+
+const familySchema = Joi.object({
+    unionEvent: eventSchema,
+    husbandIndividualId: idSchema,
+    wifeIndividualId: idSchema,
 }).required();
+
+function requiredIdMapSchema(valuesSchema) {
+    return Joi.object().pattern(/^.+/, valuesSchema).required();
+}
 
 const dataSchema = Joi.object({
     rootIndividualId: Joi.string(),
-    individuals: Joi.object().pattern(/^.+/, individualSchema).required(),
+    individuals: requiredIdMapSchema(individualSchema), // Keyed array of individuals
+    families: requiredIdMapSchema(familySchema), // Keyed array of families
+    ascendingRelation: requiredIdMapSchema(idSchema.required()), // Map individualId -> family
+    descendingRelation: requiredIdMapSchema(requiredIdMapSchema(Joi.array().items(idSchema.required()).required())), // Map individualId -> families with children
 });
 
 // Config
 
-const colorsSchema = Joi.object({
-
-});
-
 const ORIENTATION_HORIZONTAL = 'horizontal';
 const ORIENTATION_VERTICAL = 'vertical';
 
-const layersShape = {
+const TEXT_OVERFLOW_IGNORE = 'ignore';
+const TEXT_OVERFLOW_ELLIPSIS = 'ellipsis';
+const TEXT_OVERFLOW_SHRINK = 'shrink';
+
+const layersSchema = Joi.object({
     unions: Joi.object({
         enabled: Joi.boolean().default(true),
     }).default(),
     dates: Joi.object({
         //unions: Joi.object(),
     }).default(),
-    rows: Joi.object({
-        texts: Joi.array().min(1).items(Joi.object({
-            value: Joi.alternatives(
-                Joi.string(), // Data field name
-                Joi.function(), // Function `object => string`
-            ).required(),
-            // alignment etc.
-        })).default([
-            { value: 'surname' },
-            { value: 'given_name' },
-        ]),
-        textSize: Joi.number().positive().default(50),
-        orientation: Joi.string().valid(ORIENTATION_HORIZONTAL, ORIENTATION_VERTICAL).default(ORIENTATION_HORIZONTAL),
-        margin: Joi.object({
-            horizontalSpacing: Joi.number().positive().default(15),
-            verticalSpacing: Joi.number().positive().default(20),
-        }).default(),
-        padding: Joi.object({
-            sides: Joi.number().positive().default(10),
-            top: Joi.number().positive().default(10),
-            bottom: Joi.number().positive().default(10),
-            textSpacing: Joi.number().positive().default(10),
-        }).default(),
+    texts: Joi.array().min(1).items(Joi.object({
+        value: Joi.alternatives(
+            Joi.string(), // Data field name
+            Joi.function(), // Function `object => string`
+        ).required(),
+        // alignment etc.
+    })).default([
+        { value: 'surname' },
+        { value: 'given_name' },
+    ]),
+    textSize: Joi.number().positive().default(10),
+    textLength: Joi.number().positive().default(50),
+    orientation: Joi.string().valid(ORIENTATION_HORIZONTAL, ORIENTATION_VERTICAL).default(ORIENTATION_HORIZONTAL),
+    padding: Joi.object({
+        sides: Joi.number().positive().default(10),
+        top: Joi.number().positive().default(10),
+        bottom: Joi.number().positive().default(10),
+        textSpacing: Joi.number().positive().default(10),
     }).default(),
-};
+}).required();
 
 const configSchema = Joi.object({
-    generations: Joi.number().integer().default(5),
-    layers: Joi.object({
-        ...layersShape,
-        override: Joi.object().pattern(/^[1-9][0-9]*/, Joi.object(layersShape).options({ noDefaults: true })).default(),
+    generations: Joi.object({
+        ascending: Joi.number().integer().positive().default(5),
+        descending: Joi.number().integer().positive().default(5),
     }).default(),
-    width: Joi.number().positive().default(1000),
+    layers: Joi.object().pattern(/^[1-9][0-9]*/, layersSchema.options({ noDefaults: true })).default(),
     margin: Joi.object({
         sides: Joi.number().positive().default(25),
         top: Joi.number().positive().default(25),
@@ -82,107 +86,165 @@ const configSchema = Joi.object({
     style: Joi.object().default(),
 }).required().default();
 
-function computeDepth(data) {
-    // Does not support cycles / is efficient for trees only
+// Computations and drawing
+
+function getLayerConfig(previous, current) {
+    return deepMerge(previous, current || {});
+}
+
+function computeBoxDimensions(layerConfig) {
+    if(layerConfig.orientation === ORIENTATION_HORIZONTAL) {
+        const width = 2 * layerConfig.padding.sides + layerConfig.textLength;
+        const height = layerConfig.padding.top + layerConfig.padding.bottom + layerConfig.texts.length * layerConfig.textSize + (layerConfig.texts.length - 1) * layerConfig.padding.textSpacing;
+        return { width, height };
+    } else if(layerConfig.orientation === ORIENTATION_VERTICAL) {
+        return null; // TODO implement
+    } else {
+        return null;
+    }
+}
+
+function computeAscendingProperties(data, config) {
+    const maxDepth = config.generations.ascending;
     let individualIds = new Set([data.rootIndividualId]);
-    let isEmpty;
+    let isEmpty = false;
     let depth = 0;
-    do {
+    let width = 0, height = 0;
+    let previousLayerConfig = Joi.attempt({}, layersSchema.default());
+    const layersConfigs = [];
+    while (!isEmpty && depth < maxDepth) {
         isEmpty = true;
+
+        const layerConfig = getLayerConfig(previousLayerConfig, config.layers[depth]);
+
+        const expectedIndividuals = 1 << depth;
+        const { width: boxWidth, height: boxHeight } = computeBoxDimensions(layerConfig);
+        const currentWidth = expectedIndividuals * boxWidth;
+        layersConfigs.push(layerConfig);
+
+        width = Math.max(currentWidth, width);
+        height += boxHeight;
+
         const parentIndividualIds = new Set();
         for(const individualId of individualIds.values()) {
             if(individualId != null) {
-                const individual = data.individuals[individualId];
-                if (individual != null) {
-                    isEmpty = false;
-                    const parents = individual.parents;
-                    parentIndividualIds.add(parents.husbandIndividualId);
-                    parentIndividualIds.add(parents.wifeIndividualId);
+                const parentsFamilyId = data.ascendingRelation[individualId];
+                if (parentsFamilyId != null) {
+                    const parentsFamily = data.families[parentsFamilyId];
+                    if(parentsFamily != null) {
+                        [parentsFamily.husbandIndividualId, parentsFamily.wifeIndividualId]
+                            .filter(id => id != null)
+                            .forEach(id => {
+                                isEmpty = false;
+                                parentIndividualIds.add(id)
+                            });
+                    }
                 }
             }
         }
+
         if(!isEmpty) {
             depth += 1;
         }
+
         individualIds = parentIndividualIds;
-    } while (!isEmpty);
-    return depth;
-}
-
-function getOverridableConfig(configValue, i) {
-    return deepMerge(configValue, configValue.override[i] || {});
-}
-
-function getLayerConfig(config, i) {
-    return getOverridableConfig(config.layers, i);
-}
-
-function computeBoxHeight(layerConfig) {
-    const rows = layerConfig.rows;
-    const textsCount = rows.texts.length;
-    return rows.padding.top + rows.padding.bottom + (textsCount - 1) * rows.padding.textSpacing + textsCount * rows.textSize;
-}
-
-function computeHeight(config, depth) {
-    let height = config.margin.top + config.margin.bottom; // Page margins
-    for(let i = 0; i < depth; i++) {
-        const layer = getLayerConfig(config, i);
-        const rows = layer.rows;
-        if(i < depth - 1) {
-            height += rows.margin.verticalSpacing; // Box margins
-        }
-        if(rows.orientation === ORIENTATION_HORIZONTAL) {
-            // Box padding & text
-            height += computeBoxHeight(layer);
-        } else {
-            // TODO
-            throw 'Not implemented';
-        }
+        previousLayerConfig = layerConfig;
     }
-    return height;
+    return { depth, width, height, layersConfigs };
 }
 
-export function drawRectangle(inputData, inputConfig = {}) {
+/*function computeDescendingProperties(data, config) {
+    const maxDepth = config.generations.descending;
+    let individualIds = [data.rootIndividualId];
+    let isEmpty = false;
+    let depth = 0;
+    let width = 0, height = 0;
+    let previousLayerConfig = layersSchema.default();
+    const graph = [];
+    while(!isEmpty && depth <= maxDepth) {
+        isEmpty = true;
+
+        const layerConfig = getLayerConfig(previousLayerConfig, config.layers[-depth]);
+
+        const childrenIndividualIds = [];
+        const graphLayer = [];
+        for(let i = 0; i < individualIds.length; i++) {
+            const graphIndividual = [];
+            const individualId = individualIds[i];
+            if(individualId != null) {
+                const children = data.descendingRelation[individualId];
+                for(const [familyId, childrenList] of Object.entries(children)) {
+                    for(const childId of childrenList) {
+                        isEmpty = false;
+                        graphIndividual.push(i);
+                        childrenIndividualIds.push(childId);
+                    }
+                }
+            }
+            graphLayer.push(graphIndividual);
+        }
+        graph.push(graphLayer);
+
+
+        if(!isEmpty) {
+            depth += 1;
+        }
+        individualIds = childrenIndividualIds;
+        previousLayerConfig = layerConfig;
+    }
+
+    // TODO graph
+}*/
+
+export async function drawRectangle(inputData, inputConfig = {}, ref = null) {
     const data = Joi.attempt(inputData, dataSchema);
     const config = Joi.attempt(inputConfig, configSchema);
 
-    const depth = Math.min(computeDepth(data), config.generations);
+    //computeDescendingProperties(data, config);return; // FIXME remove
+    const { depth, width, height, layersConfigs } = computeAscendingProperties(data, config);
 
-    const width = config.width;
-    const height = computeHeight(config, depth);
+    const realWidth = 2 * config.margin.sides + width;
+    const realHeight = config.margin.top + config.margin.bottom + height;
+
     const svg = createSVG({
-        viewBox: `0 0 ${width} ${height}`,
+        viewBox: `0 0 ${realWidth} ${realHeight}`,
         ...config.style,
     });
 
-    let individualIds = [data.rootIndividualId];
-    for(let i = 0; i < depth; i++) {
-        const layerConfig = getLayerConfig(config, i);
+    const allTexts = [];
+    let boxY = realHeight - config.margin.bottom;
 
-        const rectangleHeight = computeBoxHeight(layerConfig);
-        const rectangleY = height - config.margin.bottom - i * (rectangleHeight + layerConfig.rows.margin.verticalSpacing) - rectangleHeight;
+    let individualIds = [data.rootIndividualId];
+    for (let i = 0; i < depth; i++) {
+        const layerConfig = layersConfigs[i];
 
         const totalExpectedIndividuals = 1 << i;
         const parentIndividualIds = [];
 
-        const rectangleWidth = (width - 2 * config.margin.sides - (totalExpectedIndividuals - 1) * layerConfig.rows.margin.horizontalSpacing) / totalExpectedIndividuals;
+        const { height: boxHeight } = computeBoxDimensions(layerConfig);
+        const boxWidth = width / totalExpectedIndividuals;
+        const textLength = boxWidth - 2 * layerConfig.padding.sides;
+        boxY -= boxHeight;
 
-        for(let j = 0; j < totalExpectedIndividuals; j++) {
+        for (let j = 0; j < totalExpectedIndividuals; j++) {
             const individualId = individualIds[j];
-            if(individualId != null) {
-                const individual = data.individuals[individualId];
-                if(individual != null) {
-                    const parents = individual.parents;
-                    parentIndividualIds.push(parents.husbandIndividualId, parents.wifeIndividualId);
+            const individual = data.individuals[individualId];
+            if (individualId != null && individual != null) {
+                const parentsFamilyId = data.ascendingRelation[individualId];
+                const parentsFamily = data.families[parentsFamilyId];
+                if (parentsFamilyId != null && parentsFamily != null) {
+                    parentIndividualIds.push(parentsFamily.husbandIndividualId, parentsFamily.wifeIndividualId);
+                } else {
+                    parentIndividualIds.push(undefined, undefined);
                 }
 
-                const rectangleX = config.margin.sides + j * (layerConfig.rows.margin.horizontalSpacing + rectangleWidth);
+                const boxX = config.margin.sides + j * boxWidth;
 
                 const rect = createElement('rect', {
-                    x: rectangleX,
-                    y: rectangleY,
-                    width: rectangleWidth,
-                    height: rectangleHeight,
+                    x: boxX,
+                    y: boxY,
+                    width: boxWidth,
+                    height: boxHeight,
                     fill: 'none',
                     stroke: 'black',
                     strokeWidth: 1,
@@ -193,32 +255,41 @@ export function drawRectangle(inputData, inputConfig = {}) {
                     given_name: individual.givenName,
                 }
 
-                const texts = layerConfig.rows.texts;
-                for(let k = 0; k < texts.length; k++) {
+                const texts = layerConfig.texts;
+                for (let k = 0; k < texts.length; k++) {
                     const textData = texts[k];
                     const text = createElement('text', {
-                        x: rectangleX + rectangleWidth / 2,
-                        y: rectangleY + layerConfig.rows.padding.top + k * (layerConfig.rows.padding.textSpacing + layerConfig.rows.textSize) + layerConfig.rows.textSize / 2,
+                        x: boxX + boxWidth / 2,
+                        y: boxY + layerConfig.padding.top + k * (layerConfig.padding.textSpacing + layerConfig.textSize) + layerConfig.textSize / 2,
                         'dominant-baseline': 'middle',
                         'text-anchor': 'middle',
-                        'font-size': 16,
-                        /*'inline-size': rectangleWidth,
-                        style: 'text-overflow: clip',*/
+                        'font-size': layerConfig.textSize,
                     });
                     text.textContent = apiData[textData.value]; // TODO function
 
-                    //adaptTextSize(text, 16, rectangleWidth);
+                    allTexts.push([text, layerConfig.textSize, textLength]);
 
                     svg.append(text); // TODO reorder elements
                 }
 
                 svg.append(rect);
+            } else {
+                parentIndividualIds.push(undefined, undefined);
             }
         }
 
         individualIds = parentIndividualIds;
     }
 
+    if(ref) {
+        ref.innerHTML = ''; // Clear DOM
+        ref.append(svg);
+    }
+
+    // The following won't work if `ref` is `null`
+    allTexts.forEach(([textElement, fontSize, fitTextLength]) => {
+        adaptTextSize(textElement, fontSize, fitTextLength);
+    });
 
     return svg;
 }
